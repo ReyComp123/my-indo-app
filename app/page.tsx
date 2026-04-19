@@ -1,10 +1,10 @@
 'use client';
 
 import React, { useState, useEffect, useRef } from 'react';
-import { Send, Book, MessageCircle, BookOpen, BrainCircuit, Pin, ChevronDown, ChevronUp, Layers, Check } from 'lucide-react';
+import { Send, Book, MessageCircle, BookOpen, BrainCircuit, Pin, ChevronDown, ChevronUp, Layers, Check, Trash2, Filter } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, User } from 'firebase/auth';
-import { getFirestore, collection, doc, addDoc, updateDoc, onSnapshot } from 'firebase/firestore';
+import { getFirestore, collection, doc, addDoc, updateDoc, deleteDoc, onSnapshot } from 'firebase/firestore';
 
 // グローバル変数の型宣言
 declare const __firebase_config: string | undefined;
@@ -95,6 +95,7 @@ export default function App() {
   const [fcQueue, setFcQueue] = useState<Word[]>([]);
   const [fcCurrentIdx, setFcCurrentIdx] = useState(0);
   const [fcIsFlipped, setFcIsFlipped] = useState(false);
+  const [fcFilter, setFcFilter] = useState<'all' | 'pinned' | 'low_accuracy'>('all');
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -241,6 +242,14 @@ export default function App() {
     await updateDoc(docRef, { note: newNote });
   };
 
+  const handleDeleteWord = async (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!user) return;
+    if (!window.confirm('この単語を削除しますか？')) return;
+    const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'words', id);
+    await deleteDoc(docRef);
+  };
+
   const toggleExpand = (id: string) => {
     setExpandedWords(prev => ({ ...prev, [id]: !prev[id] }));
   };
@@ -305,7 +314,16 @@ export default function App() {
 
   const startFlashcards = () => {
     if (words.length === 0) return;
-    setFcQueue([...words].sort(() => Math.random() - 0.5));
+    const filtered = words.filter(w => {
+      if (fcFilter === 'pinned') return w.isPinned;
+      if (fcFilter === 'low_accuracy') return (w.stats?.total || 0) > 0 && (w.stats.correct / w.stats.total) < 0.5;
+      return true;
+    });
+    if (filtered.length === 0) {
+      alert('該当する単語がありません。フィルターを変えてみてください。');
+      return;
+    }
+    setFcQueue([...filtered].sort(() => Math.random() - 0.5));
     setFcCurrentIdx(0);
     setFcIsFlipped(false);
     setActiveTab('flashcard_play');
@@ -381,6 +399,7 @@ export default function App() {
                 </div>
                 <div className="flex items-center gap-2 text-[10px] text-gray-400">
                   {Math.round((w.stats?.correct / (w.stats?.total || 1)) * 100)}%
+                  <button onClick={(e) => handleDeleteWord(w.id, e)} className="text-gray-300 hover:text-red-400 transition-colors ml-1"><Trash2 size={15}/></button>
                   {expandedWords[w.id] ? <ChevronUp size={16}/> : <ChevronDown size={16}/>}
                 </div>
               </div>
@@ -452,7 +471,23 @@ export default function App() {
             <div className="flex flex-col h-full items-center justify-center p-8 text-center bg-gray-50">
               <Layers size={64} className="text-orange-400 mb-4"/>
               <h2 className="text-2xl font-bold text-gray-800">暗記モード</h2>
-              <p className="text-gray-400 mt-2 mb-8">みんなが登録した {words.length} 単語を復習しよか！</p>
+              <p className="text-gray-400 mt-2 mb-6">みんなが登録した {words.length} 単語を復習しよか！</p>
+              <div className="w-full mb-6 bg-white rounded-2xl border border-gray-200 p-4 shadow-sm text-left">
+                <p className="text-xs font-bold text-gray-500 mb-3 flex items-center gap-1"><Filter size={12}/>出題する単語</p>
+                <div className="space-y-2">
+                  {([
+                    { value: 'all', label: '全単語', count: words.length },
+                    { value: 'pinned', label: 'ピン留めのみ', count: words.filter(w => w.isPinned).length },
+                    { value: 'low_accuracy', label: '正答率50%未満', count: words.filter(w => (w.stats?.total || 0) > 0 && (w.stats.correct / w.stats.total) < 0.5).length },
+                  ] as { value: 'all' | 'pinned' | 'low_accuracy'; label: string; count: number }[]).map(opt => (
+                    <label key={opt.value} className="flex items-center gap-3 cursor-pointer">
+                      <input type="radio" name="fcFilter" value={opt.value} checked={fcFilter === opt.value} onChange={() => setFcFilter(opt.value)} className="accent-orange-500"/>
+                      <span className="text-sm text-gray-700 flex-1">{opt.label}</span>
+                      <span className="text-xs text-gray-400">{opt.count}語</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
               <button onClick={startFlashcards} disabled={words.length === 0} className="w-full py-4 bg-orange-500 text-white rounded-2xl font-bold shadow-lg disabled:bg-gray-300">スタート</button>
             </div>
           )}
