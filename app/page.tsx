@@ -46,9 +46,10 @@ interface QuizState {
   target: string;
 }
 
-interface GeminiPayload {
-  contents: { parts: { text: string }[] }[];
-  generationConfig?: { responseMimeType: string };
+interface MoonshotPayload {
+  model: string;
+  messages: { role: string; content: string }[];
+  response_format?: { type: string };
 }
 
 /**
@@ -72,9 +73,14 @@ const auth = getAuth(app);
 const db = getFirestore(app);
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'my-indonesian-app';
 
-// Gemini API Key
-const apiKey = (typeof process !== 'undefined' && process.env.NEXT_PUBLIC_GEMINI_API_KEY)
-  ? process.env.NEXT_PUBLIC_GEMINI_API_KEY
+// Moonshot API Key
+const apiKey = (typeof process !== 'undefined' && process.env.NEXT_PUBLIC_MOONSHOT_API_KEY)
+  ? process.env.NEXT_PUBLIC_MOONSHOT_API_KEY
+  : "";
+
+// DeepL API Key
+const deeplApiKey = (typeof process !== 'undefined' && process.env.NEXT_PUBLIC_DEEPL_API_KEY)
+  ? process.env.NEXT_PUBLIC_DEEPL_API_KEY
   : "";
 
 export default function App() {
@@ -96,6 +102,7 @@ export default function App() {
   const [fcCurrentIdx, setFcCurrentIdx] = useState(0);
   const [fcIsFlipped, setFcIsFlipped] = useState(false);
   const [fcFilter, setFcFilter] = useState<'all' | 'pinned' | 'low_accuracy'>('all');
+  const [generatingSituations, setGeneratingSituations] = useState<Record<string, boolean>>({});
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -141,41 +148,78 @@ export default function App() {
   }, [messages]);
 
   // API Helper
-  const callGeminiAPI = async (prompt: string, expectJson = false): Promise<unknown> => {
-    if (!apiKey) {
-      alert('Gemini APIキーが設定されていません。.env.local に NEXT_PUBLIC_GEMINI_API_KEY を設定してください。');
+  const callDeepL = async (text: string, targetLang: string): Promise<string | null> => {
+    try {
+      const res = await fetch('/api/translate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, targetLang }),
+      });
+      if (!res.ok) {
+        console.error('Translate API error:', res.status);
+        return null;
+      }
+      const data = await res.json();
+      return data.text || null;
+    } catch (e) {
+      console.error('Translate fetch error:', e);
       return null;
     }
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
-    const payload: GeminiPayload = {
-      contents: [{ parts: [{ text: prompt }] }],
-    };
-    if (expectJson) payload.generationConfig = { responseMimeType: "application/json" };
+  };
 
-    const retryDelays = [1000, 2000, 4000];
+  const callAI = async (prompt: string, expectJson = false): Promise<unknown> => {
+    if (!apiKey) {
+      alert('Moonshot APIキーが設定されていません。.env.local に NEXT_PUBLIC_MOONSHOT_API_KEY を設定してください。');
+      return null;
+    }
+    const url = 'https://api.moonshot.ai/v1/chat/completions';
+    const payload: MoonshotPayload = {
+      model: 'kimi-k2.6',
+      messages: [{ role: 'user', content: prompt }],
+    };
+    if (expectJson) payload.response_format = { type: 'json_object' };
+
+    const retryDelays = [1000, 2000, 4000, 8000, 10000];
     for (let i = 0; i <= retryDelays.length; i++) {
       try {
         const res = await fetch(url, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`
+          },
           body: JSON.stringify(payload)
         });
         if (!res.ok) {
           const errBody = await res.json().catch(() => ({}));
-          console.error('Gemini API error:', res.status, errBody);
-          // 4xx はリトライしない（APIキー不正・リクエスト不正）
+          console.error('Moonshot API error:', res.status, errBody);
+          // 429 Too Many Requests はレート制限なので長めに待ってリトライ
+          if (res.status === 429) {
+            const delay = (retryDelays[i] || 10000) + 2000;
+            console.warn(`Moonshot 429: ${delay}ms 後にリトライ (${i + 1}/${retryDelays.length})`);
+            await new Promise(r => setTimeout(r, delay));
+            continue;
+          }
+          // 4xx はリトライしない（APIキー不正・リクエスト不正など）
           if (res.status >= 400 && res.status < 500) {
-            alert(`Gemini API エラー (${res.status}): APIキーを確認してください。`);
+            alert(`Moonshot API エラー (${res.status}): APIキーを確認してください。`);
             return null;
+          }
+          // 503 Service Unavailable は混雑の可能性が高いので長めに待ってリトライ
+          if (res.status === 503) {
+            const delay = retryDelays[i] || 10000;
+            console.warn(`Moonshot 503: ${delay}ms 後にリトライ (${i + 1}/${retryDelays.length})`);
+            await new Promise(r => setTimeout(r, delay));
+            continue;
           }
           throw new Error(`HTTP ${res.status}`);
         }
         const data = await res.json();
-        const text = data.candidates[0].content.parts[0].text;
+        const text = data.choices[0].message.content;
         return expectJson ? JSON.parse(text) : text;
       } catch (e) {
         if (i === retryDelays.length) {
-          alert('Gemini API への接続に失敗しました。ネットワークを確認してください。');
+          alert('Moonshot API が一時的に混雑しています。時間を置いて再度お試しください。');
           return null;
         }
         await new Promise(r => setTimeout(r, retryDelays[i]));
@@ -185,17 +229,94 @@ export default function App() {
   };
 
   // 3. Actions with Firestore
-  const handleAddWord = async () => {
+  const handleAddWord = () => {
     if (!inputWord.trim() || !user) return;
+
+    const searchQuery = inputWord.trim();
+    setInputWord('');
     setIsGeneratingWords(true);
 
+    const wordsRef = collection(db, 'artifacts', appId, 'public', 'data', 'words');
+
+    // DeepL翻訳を試行（無料・高速）
+    const deeplIdPromise = callDeepL(searchQuery, 'ID');
+    const deeplEnPromise = callDeepL(searchQuery, 'EN-US');
+
+    Promise.all([deeplIdPromise, deeplEnPromise]).then(([idText, enText]) => {
+      if (idText) {
+        // DeepL成功：即座にFirestore保存
+        addDoc(wordsRef, {
+          word: idText,
+          translation: searchQuery,
+          englishSimilarity: enText || '',
+          stats: { correct: 0, total: 0 },
+          isPinned: false,
+          note: `検索した日本語: ${searchQuery}`,
+          createdAt: Date.now(),
+          createdBy: user.uid
+        }).catch(err => {
+          console.error('addDoc error:', err);
+          alert('保存に失敗しました。ネットワークを確認してください。');
+        });
+      } else {
+        // DeepL失敗：Moonshot APIで翻訳（フォールバック）
+        const tempData = {
+          word: searchQuery,
+          translation: '⏳ 翻訳中...',
+          englishSimilarity: '',
+          stats: { correct: 0, total: 0 },
+          isPinned: false,
+          note: `検索した日本語: ${searchQuery}`,
+          createdAt: Date.now(),
+          createdBy: user.uid
+        };
+
+        addDoc(wordsRef, tempData).then((docRef) => {
+          const prompt = `
+            ユーザーが入力した日本語「${searchQuery}」の文脈を読み取り、最も適した日常的なインドネシア語の単語やフレーズを一つ選定し、以下の情報を出力してください。
+            出力は以下のJSON形式のみにしてください。
+            {
+              "indonesianWord": "...",
+              "translation": "...",
+              "englishSimilarity": "..."
+            }
+          `;
+
+          callAI(prompt, true).then((result) => {
+            const data = result as { indonesianWord: string; translation: string; englishSimilarity: string } | null;
+            if (data) {
+              updateDoc(docRef, {
+                word: data.indonesianWord,
+                translation: data.translation,
+                englishSimilarity: data.englishSimilarity,
+              }).catch(err => console.error('updateDoc error:', err));
+            } else {
+              deleteDoc(docRef).catch(err => console.error('deleteDoc error:', err));
+            }
+          }).catch((err) => {
+            console.error('API error:', err);
+            deleteDoc(docRef).catch(e => console.error('deleteDoc error:', e));
+          });
+        }).catch((err) => {
+          console.error('addDoc error:', err);
+          alert('保存に失敗しました。ネットワークを確認してください。');
+        });
+      }
+    }).catch((err) => {
+      console.error('DeepL error:', err);
+    }).finally(() => {
+      setIsGeneratingWords(false);
+    });
+  };
+
+  const handleAddSituations = async (word: Word) => {
+    if (!user) return;
+    setGeneratingSituations(prev => ({ ...prev, [word.id]: true }));
+
     const prompt = `
-      ユーザーが入力した日本語「${inputWord}」の文脈を読み取り、最も適した日常的なインドネシア語の単語やフレーズを一つ選定し、以下の情報を出力してください。
+      インドネシア語「${word.word}」（意味: ${word.translation}）を使った日常会話の例文を、以下の3つの関係性で生成してください。
       出力は以下のJSON形式のみにしてください。
       {
-        "indonesianWord": "...",
-        "translation": "...",
-        "englishSimilarity": "...",
         "situations": [
           {"type": "Bro/Sist", "indonesian": "...", "japanese": "...", "structure": "...", "explanation": "...", "trivia": "..."},
           {"type": "Teman", "indonesian": "...", "japanese": "...", "structure": "...", "explanation": "...", "trivia": "..."},
@@ -205,27 +326,18 @@ export default function App() {
     `;
 
     try {
-      const result = await callGeminiAPI(prompt, true) as { indonesianWord: string; translation: string; englishSimilarity: string; situations: Situation[] } | null;
+      const result = await callAI(prompt, true) as { situations: Situation[] } | null;
       if (result) {
-        const wordsRef = collection(db, 'artifacts', appId, 'public', 'data', 'words');
-        await addDoc(wordsRef, {
-          word: result.indonesianWord,
-          translation: result.translation,
-          englishSimilarity: result.englishSimilarity,
-          situations: result.situations,
-          stats: { correct: 0, total: 0 },
-          isPinned: false,
-          note: `検索した日本語: ${inputWord}`,
-          createdAt: Date.now(),
-          createdBy: user.uid
-        });
-        setInputWord('');
+        const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'words', word.id);
+        await updateDoc(docRef, { situations: result.situations });
+      } else {
+        alert('例文の生成に失敗しました。もう一度お試しください。');
       }
     } catch (e) {
-      console.error('単語の保存に失敗:', e);
-      alert('保存に失敗しました。Firestore のセキュリティルールを確認してください。');
+      console.error('例文の保存に失敗:', e);
+      alert('例文の保存に失敗しました。');
     } finally {
-      setIsGeneratingWords(false);
+      setGeneratingSituations(prev => ({ ...prev, [word.id]: false }));
     }
   };
 
@@ -269,7 +381,7 @@ export default function App() {
     const randomWord = words[Math.floor(Math.random() * words.length)];
     const target = roleplayTarget.split(' ')[0];
     const prompt = `あなたはインドネシア語の先生（関西弁）です。「${randomWord.word}」を使って「${target}」に向けたお題をチャット風に出して。`;
-    const questionText = await callGeminiAPI(prompt, false) as string | null;
+    const questionText = await callAI(prompt, false) as string | null;
     if (questionText) {
       setCurrentQuiz({ word: randomWord, target });
       setMessages(prev => [...prev, { id: Date.now().toString(), sender: 'ai', text: questionText }]);
@@ -286,7 +398,7 @@ export default function App() {
 
     if (currentQuiz) {
       const prompt = `お題:「${currentQuiz.word.word}」、相手:「${currentQuiz.target}」、回答:「${chatInput}」。添削かヒント（なんだっけ？と言われたらヒント）をJSON {"type":"evaluation|hint", "isCorrect":bool, "emoji":"...", "feedback":"..."} で出力。関西弁で。`;
-      const evalResult = await callGeminiAPI(prompt, true) as { type: string; isCorrect: boolean; emoji: string; feedback: string } | null;
+      const evalResult = await callAI(prompt, true) as { type: string; isCorrect: boolean; emoji: string; feedback: string } | null;
       if (evalResult) {
         if (evalResult.type === 'evaluation') {
           const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'words', currentQuiz.word.id);
@@ -304,7 +416,7 @@ export default function App() {
 ユーザーの質問: 「${chatInput}」
 インドネシア語に関する質問なら丁寧に関西弁で答えてください。例文も添えてください。
 クイズをやりたいと言われたら「クイズボタン（脳みそアイコン）を押してや！」と案内してください。`;
-      const answer = await callGeminiAPI(prompt, false) as string | null;
+      const answer = await callAI(prompt, false) as string | null;
       if (answer) {
         setMessages(prev => [...prev, { id: Date.now().toString(), sender: 'ai', text: answer }]);
       }
@@ -417,6 +529,15 @@ export default function App() {
                       </div>
                     ))}
                   </div>
+                  {(!w.situations || w.situations.length === 0) && (
+                    <button
+                      onClick={(e) => { e.stopPropagation(); handleAddSituations(w); }}
+                      disabled={generatingSituations[w.id]}
+                      className="mt-2 w-full py-2 bg-green-500 text-white text-xs rounded-lg font-medium disabled:bg-gray-300"
+                    >
+                      {generatingSituations[w.id] ? '例文生成中...' : '✨ Bro/Sist・Teman・Orang Tua の例文を追加'}
+                    </button>
+                  )}
                   <div className="mt-2">
                     <p className="text-[10px] font-bold text-amber-800 mb-1">My Note:</p>
                     <textarea value={w.note || ''} onChange={(e) => updateNote(w.id, e.target.value)} className="w-full p-2 text-xs border border-amber-100 rounded bg-amber-50/30 min-h-[60px]" placeholder="自分だけのメモ..."/>
