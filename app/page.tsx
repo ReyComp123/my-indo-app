@@ -150,19 +150,21 @@ export default function App() {
   // API Helper
   const callDeepL = async (text: string, targetLang: string): Promise<string | null> => {
     try {
+      console.log('[callDeepL] Requesting:', { text, targetLang });
       const res = await fetch('/api/translate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text, targetLang }),
       });
+      const data = await res.json();
+      console.log('[callDeepL] Response:', { status: res.status, data });
       if (!res.ok) {
-        console.error('Translate API error:', res.status);
+        console.error('[callDeepL] API error:', res.status, data);
         return null;
       }
-      const data = await res.json();
       return data.text || null;
     } catch (e) {
-      console.error('Translate fetch error:', e);
+      console.error('[callDeepL] Fetch error:', e);
       return null;
     }
   };
