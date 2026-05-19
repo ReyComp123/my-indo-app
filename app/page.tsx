@@ -148,7 +148,7 @@ export default function App() {
   }, [messages]);
 
   // API Helper
-  const callDeepL = async (text: string, targetLang: string): Promise<string | null> => {
+  const callDeepL = async (text: string, targetLang: string): Promise<{ text: string | null; detectedSourceLanguage: string | null }> => {
     try {
       console.log('[callDeepL] Requesting:', { text, targetLang });
       const res = await fetch('/api/translate', {
@@ -160,12 +160,12 @@ export default function App() {
       console.log('[callDeepL] Response:', { status: res.status, data });
       if (!res.ok) {
         console.error('[callDeepL] API error:', res.status, data);
-        return null;
+        return { text: null, detectedSourceLanguage: null };
       }
-      return data.text || null;
+      return { text: data.text || null, detectedSourceLanguage: data.detectedSourceLanguage || null };
     } catch (e) {
       console.error('[callDeepL] Fetch error:', e);
-      return null;
+      return { text: null, detectedSourceLanguage: null };
     }
   };
 
@@ -241,25 +241,51 @@ export default function App() {
     const wordsRef = collection(db, 'artifacts', appId, 'public', 'data', 'words');
 
     // DeepL翻訳を試行（無料・高速）
+    // まず target_lang=ID で翻訳し、ソース言語を自動検出
     const deeplIdPromise = callDeepL(searchQuery, 'ID');
     const deeplEnPromise = callDeepL(searchQuery, 'EN-US');
 
-    Promise.all([deeplIdPromise, deeplEnPromise]).then(([idText, enText]) => {
+    Promise.all([deeplIdPromise, deeplEnPromise]).then(([idResult, enResult]) => {
+      const idText = idResult.text;
+      const detectedLang = idResult.detectedSourceLanguage;
+      const enText = enResult.text;
+      console.log('[handleAddWord] DeepL results:', { idText, detectedLang, enText });
+
       if (idText) {
-        // DeepL成功：即座にFirestore保存
-        addDoc(wordsRef, {
-          word: idText,
-          translation: searchQuery,
-          englishSimilarity: enText || '',
-          stats: { correct: 0, total: 0 },
-          isPinned: false,
-          note: `検索した日本語: ${searchQuery}`,
-          createdAt: Date.now(),
-          createdBy: user.uid
-        }).catch(err => {
-          console.error('addDoc error:', err);
-          alert('保存に失敗しました。ネットワークを確認してください。');
-        });
+        if (detectedLang === 'ID') {
+          // インドネシア語入力 → 日本語訳も必要
+          callDeepL(searchQuery, 'JA').then(jaResult => {
+            console.log('[handleAddWord] JA translation:', jaResult);
+            addDoc(wordsRef, {
+              word: searchQuery, // インドネシア語（入力値）
+              translation: jaResult.text || searchQuery, // 日本語訳
+              englishSimilarity: enText || '',
+              stats: { correct: 0, total: 0 },
+              isPinned: false,
+              note: `検索した言語: ${searchQuery} (detected: ${detectedLang})`,
+              createdAt: Date.now(),
+              createdBy: user.uid
+            }).catch(err => {
+              console.error('addDoc error:', err);
+              alert('保存に失敗しました。ネットワークを確認してください。');
+            });
+          });
+        } else {
+          // 日本語入力（またはその他）→ 今まで通り
+          addDoc(wordsRef, {
+            word: idText, // インドネシア語訳
+            translation: searchQuery, // 日本語（入力値）
+            englishSimilarity: enText || '',
+            stats: { correct: 0, total: 0 },
+            isPinned: false,
+            note: `検索した言語: ${searchQuery} (detected: ${detectedLang})`,
+            createdAt: Date.now(),
+            createdBy: user.uid
+          }).catch(err => {
+            console.error('addDoc error:', err);
+            alert('保存に失敗しました。ネットワークを確認してください。');
+          });
+        }
       } else {
         // DeepL失敗：Moonshot APIで翻訳（フォールバック）
         const tempData = {
@@ -268,14 +294,14 @@ export default function App() {
           englishSimilarity: '',
           stats: { correct: 0, total: 0 },
           isPinned: false,
-          note: `検索した日本語: ${searchQuery}`,
+          note: `検索した言語: ${searchQuery}`,
           createdAt: Date.now(),
           createdBy: user.uid
         };
 
         addDoc(wordsRef, tempData).then((docRef) => {
           const prompt = `
-            ユーザーが入力した日本語「${searchQuery}」の文脈を読み取り、最も適した日常的なインドネシア語の単語やフレーズを一つ選定し、以下の情報を出力してください。
+            ユーザーが入力した言語「${searchQuery}」の文脈を読み取り、最も適した日常的なインドネシア語の単語やフレーズを一つ選定し、以下の情報を出力してください。
             出力は以下のJSON形式のみにしてください。
             {
               "indonesianWord": "...",

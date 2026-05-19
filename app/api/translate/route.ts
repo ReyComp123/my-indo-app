@@ -11,7 +11,8 @@ export async function POST(req: Request) {
       return Response.json({ error: 'DeepL API key not configured' }, { status: 500 });
     }
 
-    const body = new URLSearchParams({ text, target_lang: targetLang, source_lang: 'JA' });
+    // source_lang を省略 → 自動言語検出
+    const body = new URLSearchParams({ text, target_lang: targetLang });
     const res = await fetch('https://api-free.deepl.com/v2/translate', {
       method: 'POST',
       headers: {
@@ -29,8 +30,11 @@ export async function POST(req: Request) {
 
     const data = await res.json();
     console.log('[DeepL API] Response:', data);
-    const translatedText = data.translations?.[0]?.text || null;
-    return Response.json({ text: translatedText });
+    const t = data.translations?.[0];
+    return Response.json({ 
+      text: t?.text || null, 
+      detectedSourceLanguage: t?.detected_source_language || null 
+    });
   } catch (e) {
     console.error('[DeepL API] Exception:', e);
     return Response.json({ error: 'Internal server error', details: String(e) }, { status: 500 });
